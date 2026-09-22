@@ -25,6 +25,9 @@ function createApp() {
   app.use(helmet({
     contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], objectSrc: ["'none'"] } },
     hsts: { maxAge: 31536000, includeSubDomains: true },
+    noSniff: true,
+    xssFilter: true,
+    hidePoweredBy: true,
   }));
   app.use(cors({ origin: env.corsOrigin, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
