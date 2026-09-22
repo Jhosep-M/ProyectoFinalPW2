@@ -28,25 +28,29 @@ router.post('/', authorize('pedido.crear'), async (req, res, next) => {
   try {
     const parsed = createOrderSchema.parse(req.body);
     const meseroId = parsed.mesero_id || req.user.id;
-    const [pedidoRows] = await sequelize.query(
-      `INSERT INTO pedido (mesa_id, mesero_id, estado) VALUES (:mesa, :mesero, :estado) RETURNING *`,
-      { replacements: { mesa: parsed.mesa_id || null, mesero: meseroId, estado: parsed.estado } }
-    );
-    const pedido = pedidoRows[0];
-    // insertar detalles; precio se toma de producto si no viene del frontend (no confiar frontend)
-    for (const item of parsed.items) {
-      const [prodRows] = await sequelize.query(`SELECT precio FROM producto WHERE id_producto=:id`, { replacements: { id: item.producto_id } });
-      const precio = item.precio_unitario != null ? item.precio_unitario : (prodRows[0]?.precio ?? 0);
-      await sequelize.query(
-        `INSERT INTO detalle_pedido (pedido_id, producto_id, cantidad, precio_unitario, observacion) VALUES (:pedido, :prod, :cant, :precio, :obs)`,
-        { replacements: { pedido: pedido.id_pedido, prod: item.producto_id, cant: item.cantidad, precio, obs: item.observacion || parsed.observacion || null } }
+    const result = await sequelize.transaction(async (t) => {
+      const [pedidoRows] = await sequelize.query(
+        `INSERT INTO pedido (mesa_id, mesero_id, estado) VALUES (:mesa, :mesero, :estado) RETURNING *`,
+        { replacements: { mesa: parsed.mesa_id || null, mesero: meseroId, estado: parsed.estado }, transaction: t }
       );
-    }
-    await auditLog({ usuario_id: req.user.id, accion: 'pedido.crear', entidad: 'pedido', entidad_id: pedido.id_pedido, resultado: 'exito', detalle: parsed, ip: req.ip, userAgent: req.headers['user-agent'] });
-    const [detalles] = await sequelize.query(`SELECT * FROM detalle_pedido WHERE pedido_id=:id`, { replacements: { id: pedido.id_pedido } });
-    res.status(201).json({ ...pedido, detalles });
+      const pedido = pedidoRows[0];
+      for (const item of parsed.items) {
+        const [prodRows] = await sequelize.query(`SELECT precio FROM producto WHERE id_producto=:id`, { replacements: { id: item.producto_id }, transaction: t });
+        if (!prodRows[0]) throw Object.assign(new Error(`Producto no encontrado: ${item.producto_id}`), { status: 400 });
+        const precio = prodRows[0].precio;
+        await sequelize.query(
+          `INSERT INTO detalle_pedido (pedido_id, producto_id, cantidad, precio_unitario, observacion) VALUES (:pedido, :prod, :cant, :precio, :obs)`,
+          { replacements: { pedido: pedido.id_pedido, prod: item.producto_id, cant: item.cantidad, precio, obs: item.observacion || parsed.observacion || null }, transaction: t }
+        );
+      }
+      return pedido;
+    });
+    await auditLog({ usuario_id: req.user.id, accion: 'pedido.crear', entidad: 'pedido', entidad_id: result.id_pedido, resultado: 'exito', detalle: parsed, ip: req.ip, userAgent: req.headers['user-agent'] });
+    const [detalles] = await sequelize.query(`SELECT * FROM detalle_pedido WHERE pedido_id=:id`, { replacements: { id: result.id_pedido } });
+    res.status(201).json({ ...result, detalles });
   } catch (e) {
     if (e.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: e.errors });
+    if (e.status === 400) return res.status(400).json({ error: e.message });
     next(e);
   }
 });
@@ -60,17 +64,21 @@ router.patch('/:id', authorize('pedido.gestionar'), async (req, res, next) => {
     if (parsed.estado !== undefined) { sets.push('estado=:estado'); repl.estado = parsed.estado; }
     if (parsed.estado === 'cancelado' || parsed.estado === 'cobrado') { sets.push('fecha_cierre=NOW()'); }
     if (sets.length > 0) {
-      const [rows] = await sequelize.query(`UPDATE pedido SET ${sets.join(', ')} WHERE id_pedido=:id RETURNING *`, { replacements: repl });
-      if (!rows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
-      // si vienen items nuevos, reemplazar detalles (solo si estado abierto)
-      if (parsed.items) {
-        await sequelize.query(`DELETE FROM detalle_pedido WHERE pedido_id=:id`, { replacements: { id: req.params.id } });
-        for (const item of parsed.items) {
-          const [prodRows] = await sequelize.query(`SELECT precio FROM producto WHERE id_producto=:id`, { replacements: { id: item.producto_id } });
-          const precio = item.precio_unitario != null ? item.precio_unitario : (prodRows[0]?.precio ?? 0);
-          await sequelize.query(`INSERT INTO detalle_pedido (pedido_id, producto_id, cantidad, precio_unitario, observacion) VALUES (:pedido, :prod, :cant, :precio, :obs)`, { replacements: { pedido: req.params.id, prod: item.producto_id, cant: item.cantidad, precio, obs: item.observacion || null } });
+      const updatedPedido = await sequelize.transaction(async (t) => {
+        const [rows] = await sequelize.query(`UPDATE pedido SET ${sets.join(', ')} WHERE id_pedido=:id RETURNING *`, { replacements: repl, transaction: t });
+        if (!rows[0]) return null;
+        if (parsed.items) {
+          await sequelize.query(`DELETE FROM detalle_pedido WHERE pedido_id=:id`, { replacements: { id: req.params.id }, transaction: t });
+          for (const item of parsed.items) {
+            const [prodRows] = await sequelize.query(`SELECT precio FROM producto WHERE id_producto=:id`, { replacements: { id: item.producto_id }, transaction: t });
+            if (!prodRows[0]) throw Object.assign(new Error(`Producto no encontrado: ${item.producto_id}`), { status: 400 });
+            const precio = prodRows[0].precio;
+            await sequelize.query(`INSERT INTO detalle_pedido (pedido_id, producto_id, cantidad, precio_unitario, observacion) VALUES (:pedido, :prod, :cant, :precio, :obs)`, { replacements: { pedido: req.params.id, prod: item.producto_id, cant: item.cantidad, precio, obs: item.observacion || null }, transaction: t });
+          }
         }
-      }
+        return rows[0];
+      });
+      if (!updatedPedido) return res.status(404).json({ error: 'Pedido no encontrado' });
       await auditLog({ usuario_id: req.user.id, accion: 'pedido.actualizar', entidad: 'pedido', entidad_id: req.params.id, resultado: 'exito', detalle: parsed, ip: req.ip, userAgent: req.headers['user-agent'] });
       const [updated] = await sequelize.query(`SELECT * FROM pedido WHERE id_pedido=:id`, { replacements: { id: req.params.id } });
       const [detalles] = await sequelize.query(`SELECT * FROM detalle_pedido WHERE pedido_id=:id`, { replacements: { id: req.params.id } });
@@ -79,6 +87,7 @@ router.patch('/:id', authorize('pedido.gestionar'), async (req, res, next) => {
     res.json({ message: 'sin cambios' });
   } catch (e) {
     if (e.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: e.errors });
+    if (e.status === 400) return res.status(400).json({ error: e.message });
     next(e);
   }
 });

@@ -22,6 +22,7 @@ const { configRouter } = require('./routes/config');
 
 function createApp() {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(helmet({
     contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], objectSrc: ["'none'"] } },
     hsts: { maxAge: 31536000, includeSubDomains: true },

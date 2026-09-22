@@ -4,8 +4,7 @@ const orderItemSchema = z.object({
   producto_id: z.string().uuid(),
   cantidad: z.number().int().positive('cantidad debe ser entero > 0'),
   observacion: z.string().trim().max(500).nullable().optional(),
-  precio_unitario: z.number().positive().nullable().optional(),
-});
+}).strip();
 
 const createOrderSchema = z.object({
   mesa_id: z.string().uuid().nullable().optional(),
